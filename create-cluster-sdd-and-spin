@@ -1,0 +1,443 @@
+#!/bin/bash
+
+# check vm sized
+# az vm list-sizes -l westeurope | grep -i ds -n5
+
+MASTER_IPS=()
+WORKER_IPS=()
+
+MASTERS=3
+WORKERS=2
+RESOURCE_GROUP=$1 # swarm
+LOCATION="westeurope"
+USERNAME="swarm"
+VM_SIZE="Standard_DS3_v2"
+SSH_PUBLIC_PATH="~/.ssh/id_rsa.pub"
+OS_DISK_SIZE=80
+
+if [[ -z "${RESOURCE_GROUP}" ]]; then
+    echo 'specify $1 resource group name'
+    exit 1
+fi
+
+
+log () {
+    dt=$(date '+%Y.%m.%d %H:%M:%S')
+    message="${dt}: $1"
+    echo $message >> "${RESOURCE_GROUP}.log"
+    echo $message
+}
+
+log "HELLO"
+
+# resource group
+
+SUBSCRIPTION_ID=$(az account show --output tsv |  awk '{print $2}')
+
+az group create --name $RESOURCE_GROUP --location $LOCATION --output none
+log "CREATED Resource Group $RESOURCE_GROUP in $LOCATION"
+
+# disk ssd
+STORAGE_ACCOUNT_DISKS_SSD="${RESOURCE_GROUP}-disk-ssd"
+STORAGE_ACCOUNT_DISKS_SSD="${STORAGE_ACCOUNT_DISKS_SSD//-/}"
+
+az storage account create \
+    --name $STORAGE_ACCOUNT_DISKS_SSD \
+    --resource-group $RESOURCE_GROUP \
+    --https-only \
+    --location $LOCATION \
+    --kind StorageV2 \
+    --sku Premium_LRS \
+    --output none
+
+STORAGE_ACCOUNT_DISKS_SSD_KEY=$(az storage account keys list --account-name $STORAGE_ACCOUNT_DISKS_SSD --output tsv | head -n1 | awk '{print $3}')
+
+log "CREATED Storage Account $STORAGE_ACCOUNT_DISKS_SSD with key $STORAGE_ACCOUNT_DISKS_SSD_KEY"
+
+az storage container create \
+    --name disks \
+    --public-access off \
+    --auth-mode key \
+    --account-name "$STORAGE_ACCOUNT_DISKS_SSD" \
+    --account-key "$STORAGE_ACCOUNT_DISKS_SSD_KEY" \
+    --output none
+
+log "CREATED Container disks for $STORAGE_ACCOUNT_DISKS_SSD Storage Account"
+
+# volumes ssd
+VOLUME_STORAGE_ACCOUNT_SSD="${RESOURCE_GROUP}-data-ssd"
+VOLUME_STORAGE_ACCOUNT_SSD="${VOLUME_STORAGE_ACCOUNT_SSD//-/}"
+
+az storage account create \
+    --name $VOLUME_STORAGE_ACCOUNT_SSD \
+    --resource-group $RESOURCE_GROUP \
+    --https-only \
+    --location $LOCATION \
+    --kind StorageV2 \
+    --sku Premium_LRS \
+    --output none
+
+VOLUME_STORAGE_ACCOUNT_SSD_KEY=$(az storage account keys list --account-name $VOLUME_STORAGE_ACCOUNT_SSD --output tsv | head -n1 | awk '{print $3}')
+
+log "CREATED Storage Account $VOLUME_STORAGE_ACCOUNT_SSD with key $VOLUME_STORAGE_ACCOUNT_SSD_KEY"
+
+az storage container create \
+    --name volumes \
+    --public-access off \
+    --auth-mode key \
+    --account-name "$VOLUME_STORAGE_ACCOUNT_SSD" \
+    --account-key "$VOLUME_STORAGE_ACCOUNT_SSD_KEY" \
+    --output none
+
+log "CREATED Container volumes for $VOLUME_STORAGE_ACCOUNT_SSD Storage Account"
+
+# volumes spin
+VOLUME_STORAGE_ACCOUNT_SPIN="${RESOURCE_GROUP}-data-spin"
+VOLUME_STORAGE_ACCOUNT_SPIN="${VOLUME_STORAGE_ACCOUNT_SPIN//-/}"
+
+az storage account create \
+    --name $VOLUME_STORAGE_ACCOUNT_SPIN \
+    --resource-group $RESOURCE_GROUP \
+    --https-only \
+    --location $LOCATION \
+    --kind StorageV2 \
+    --sku Standard_LRS \
+    --output none
+
+VOLUME_STORAGE_ACCOUNT_SPIN_KEY=$(az storage account keys list --account-name $VOLUME_STORAGE_ACCOUNT_SPIN --output tsv | head -n1 | awk '{print $3}')
+
+log "CREATED Storage Account $VOLUME_STORAGE_ACCOUNT_SPIN with key $VOLUME_STORAGE_ACCOUNT_SPIN_KEY"
+
+az storage container create \
+    --name volumes \
+    --public-access off \
+    --auth-mode key \
+    --account-name "$VOLUME_STORAGE_ACCOUNT_SPIN" \
+    --account-key "$VOLUME_STORAGE_ACCOUNT_SPIN_KEY" \
+    --output none
+
+log "CREATED Container volumes for $VOLUME_STORAGE_ACCOUNT_SPIN Storage Account"
+
+# vnet
+VNET="${RESOURCE_GROUP}-vnet"
+
+az network vnet create \
+    --resource-group $RESOURCE_GROUP \
+    --name $VNET \
+    --address-prefix 10.0.0.0/16 \
+    --subnet-name default \
+    --subnet-prefix 10.0.1.0/24 \
+    --output none
+
+log "CREATED VNET $VNET"
+
+MASTER_NSG="${RESOURCE_GROUP}-master-nsg"
+WORKER_NSG="${RESOURCE_GROUP}-worker-nsg"
+
+az network nsg create \
+    --resource-group $RESOURCE_GROUP \
+    --name $MASTER_NSG \
+    --output none
+
+az network nsg rule create \
+    --resource-group $RESOURCE_GROUP \
+    --nsg-name $MASTER_NSG \
+    --name "${MASTER_NSG}-ssh" \
+    --protocol tcp \
+    --priority 1000 \
+    --destination-port-range 22 \
+    --access allow \
+    --output none
+
+az network nsg rule create \
+    --resource-group $RESOURCE_GROUP \
+    --nsg-name $MASTER_NSG \
+    --name "${MASTER_NSG}-http" \
+    --protocol tcp \
+    --priority 1001 \
+    --destination-port-range 80 \
+    --access allow \
+    --output none
+
+az network nsg rule create \
+    --resource-group $RESOURCE_GROUP \
+    --nsg-name $MASTER_NSG \
+    --name "${MASTER_NSG}-https" \
+    --protocol tcp \
+    --priority 1002 \
+    --destination-port-range 443 \
+    --access allow \
+    --output none
+
+log "CREATED Network Security Group $MASTER_NSG with open ports: 22,80,443"
+
+az network nsg create \
+    --resource-group $RESOURCE_GROUP \
+    --name $WORKER_NSG \
+    --output none
+
+az network nsg rule create \
+    --resource-group $RESOURCE_GROUP \
+    --nsg-name $WORKER_NSG \
+    --name "${WORKER_NSG}-ssh" \
+    --protocol tcp \
+    --priority 1000 \
+    --destination-port-range 22 \
+    --access allow \
+    --output none
+
+log "CREATED Network Security Group $WORKER_NSG with open ports: 22"
+
+for NODE in $(seq $MASTERS)
+do
+
+    IP_NAME="${RESOURCE_GROUP}-master-${NODE}-ip"
+    NIC_NAME="${RESOURCE_GROUP}-master-${NODE}-nic"
+    VM_NAME="${RESOURCE_GROUP}-master-${NODE}"
+    OS_DISK_NAME="${RESOURCE_GROUP}-master-${NODE}-os-disk"
+
+    az network public-ip create \
+        --resource-group $RESOURCE_GROUP \
+        --name $IP_NAME \
+        --allocation-method Static \
+        --dns-name $IP_NAME \
+        --output none
+
+    MASTER_IPS[$NODE]=$(az network public-ip show -g $RESOURCE_GROUP -n $IP_NAME --query "{address: ipAddress}" --output tsv)
+
+    log "CREATED Static IP $IP_NAME ${MASTER_IPS[$NODE]} for $VM_NAME"
+
+    az network nic create \
+        --resource-group $RESOURCE_GROUP \
+        --name $NIC_NAME \
+        --vnet-name $VNET \
+        --subnet default \
+        --public-ip-address $IP_NAME \
+        --network-security-group $MASTER_NSG \
+        --output none
+
+    log "CREATED NIC $NIC_NAME for $VM_NAME with NSG ${MASTER_NSG}"
+    
+    az vm create \
+        --resource-group $RESOURCE_GROUP \
+        --name $VM_NAME \
+        --location $LOCATION \
+        --nics $NIC_NAME \
+        --image UbuntuLTS \
+        --size $VM_SIZE \
+        --admin-username $USERNAME \
+        --storage-account $STORAGE_ACCOUNT_DISKS_SSD \
+        --storage-container-name disks \
+        --use-unmanaged-disk \
+        --os-disk-name $OS_DISK_NAME \
+        --os-disk-size-gb $OS_DISK_SIZE \
+        --ssh-key-value $SSH_PUBLIC_PATH \
+        --no-wait \
+        --output none
+
+    log "CREATED VM $VM_NAME with disk OS ${STORAGE_ACCOUNT_DISKS_SSD}/disks/${OS_DISK_NAME} ${OS_DISK_SIZE}gb with user $USERNAME. => ssh ${USERNAME}@${MASTER_IPS[$NODE]}"
+
+done
+
+for NODE in $(seq $WORKERS)
+do
+
+    IP_NAME="${RESOURCE_GROUP}-worker-${NODE}-ip"
+    NIC_NAME="${RESOURCE_GROUP}-worker-${NODE}-nic"
+    VM_NAME="${RESOURCE_GROUP}-worker-${NODE}"
+    OS_DISK_NAME="${RESOURCE_GROUP}-worker-${NODE}-os-disk"
+
+    az network public-ip create \
+        --resource-group $RESOURCE_GROUP \
+        --name $IP_NAME \
+        --allocation-method Static \
+        --dns-name $IP_NAME \
+        --output none
+
+    WORKER_IPS[$NODE]=$(az network public-ip show -g $RESOURCE_GROUP -n $IP_NAME --query "{address: ipAddress}" --output tsv)
+
+    log "CREATED Static IP $IP_NAME ${WORKER_IPS[$NODE]} for $VM_NAME"
+
+    az network nic create \
+        --resource-group $RESOURCE_GROUP \
+        --name $NIC_NAME \
+        --vnet-name $VNET \
+        --subnet default \
+        --public-ip-address $IP_NAME \
+        --network-security-group $WORKER_NSG \
+        --output none
+
+    log "CREATED NIC $NIC_NAME for $VM_NAME with NSG ${WORKER_NSG}"
+
+    az vm create \
+        --resource-group $RESOURCE_GROUP \
+        --name $VM_NAME \
+        --location $LOCATION \
+        --nics $NIC_NAME \
+        --image UbuntuLTS \
+        --size $VM_SIZE \
+        --admin-username $USERNAME \
+        --storage-account $STORAGE_ACCOUNT_DISKS_SSD \
+        --storage-container-name disks \
+        --use-unmanaged-disk \
+        --os-disk-name $OS_DISK_NAME \
+        --os-disk-size-gb $OS_DISK_SIZE \
+        --ssh-key-value $SSH_PUBLIC_PATH \
+        --no-wait \
+        --output none
+
+    log "CREATED VM $VM_NAME with disk OS ${STORAGE_ACCOUNT_DISKS_SSD}/disks/${OS_DISK_NAME} ${OS_DISK_SIZE}gb with user $USERNAME. => ssh ${USERNAME}@${WORKER_IPS[$NODE]}"
+
+done
+
+# create rbac app
+
+RBAC=$(az ad sp create-for-rbac --role="Contributor" --name $RESOURCE_GROUP --skip-assignment --output tsv 2> /dev/null)
+RBAC_APP_ID=$(echo $RBAC | awk '{print $1}')
+RBAC_APP_SECRET=$(echo $RBAC | awk '{print $4}')
+RBAC_TENANT_ID=$(echo $RBAC | awk '{print $5}')
+
+log "CREATED RBAC appId: ${RBAC_APP_ID} secret: ${RBAC_APP_SECRET} tenantId: ${RBAC_TENANT_ID}"
+
+az ad app permission add --id $RBAC_APP_ID --api-permissions 41094075-9dad-400e-a0bd-54e686782033=Scope --api 797f4846-ba00-4fd7-ba43-dac1f8f63013 --output none 2> /dev/null
+az ad app permission grant --id $RBAC_APP_ID --api 797f4846-ba00-4fd7-ba43-dac1f8f63013 --output none
+
+sleep 60
+
+az role assignment create --role "Owner" --assignee $RBAC_APP_ID --resource-group $RESOURCE_GROUP --output none
+
+log "GRANTED RBAC Permissions appId: ${RBAC_APP_ID} secret: ${RBAC_APP_SECRET} tenantId: ${RBAC_TENANT_ID}"
+
+
+# setup all nodes
+
+log "SETTING UP ALL NODES"
+
+MANAGER_TOKEN=""
+WORKER_TOKEN=""
+
+for NODE in $(seq $MASTERS)
+do
+
+    VM_NAME="${RESOURCE_GROUP}-master-${NODE}"
+    IP=${MASTER_IPS[$NODE]}
+    
+    log "Waiting ${VM_NAME} IP:${IP} to become alive"
+    until ssh -o "StrictHostKeyChecking=no" ${USERNAME}@${IP} "echo 1 > /dev/null"; do
+        sleep 5
+    done
+
+    log "Connected to ${VM_NAME} IP:${IP} as ${USERNAME}"
+    ssh -o "StrictHostKeyChecking=no" ${USERNAME}@${IP} "curl -fsSL https://get.docker.com | sudo sh - > /dev/null 2> /dev/null"
+    ssh -o "StrictHostKeyChecking=no" ${USERNAME}@${IP} "sudo usermod -aG docker ${USERNAME}"
+    log "Installed docker to ${VM_NAME}"
+    ssh -o "StrictHostKeyChecking=no" ${USERNAME}@${IP} "sudo apt update > /dev/null 2> /dev/null && sudo apt install lsscsi -yq > /dev/null 2> /dev/null"
+    log "Installed lsscsi to ${VM_NAME}"
+
+    if [ "$NODE" == "1" ]
+    then
+        ssh -o "StrictHostKeyChecking=no" ${USERNAME}@${IP} "docker swarm init > /dev/null 2> /dev/null"
+        log "${VM_NAME} Initialized SWARM"
+        MANAGER_TOKEN=$(ssh -o "StrictHostKeyChecking=no" ${USERNAME}@${IP} "docker swarm join-token manager -q")
+        WORKER_TOKEN=$(ssh -o "StrictHostKeyChecking=no" ${USERNAME}@${IP} "docker swarm join-token worker -q")
+        log "Written JOIN TOKENS"
+    else
+        ssh -o "StrictHostKeyChecking=no" ${USERNAME}@${IP} "docker swarm join --token $MANAGER_TOKEN 10.0.1.4:2377 > /dev/null 2> /dev/null"
+        log "${VM_NAME} Joined SWARM as MASTER"
+    fi
+    
+done
+
+for NODE in $(seq $WORKERS)
+do
+
+    VM_NAME="${RESOURCE_GROUP}-worker-${NODE}"
+    IP=${WORKER_IPS[$NODE]}
+    
+    log "Waiting ${VM_NAME} IP:${IP} to become alive"
+    until ssh -o "StrictHostKeyChecking=no" ${USERNAME}@${IP} "echo 1 > /dev/null"; do
+        sleep 5
+    done
+
+    log "Connected to ${VM_NAME} IP:${IP} as ${USERNAME}"
+    ssh -o "StrictHostKeyChecking=no" ${USERNAME}@${IP} "curl -fsSL https://get.docker.com | sudo sh - > /dev/null 2> /dev/null"
+    ssh -o "StrictHostKeyChecking=no" ${USERNAME}@${IP} "sudo usermod -aG docker ${USERNAME} > /dev/null 2> /dev/null"
+    log "Installed docker to ${VM_NAME}"
+    ssh -o "StrictHostKeyChecking=no" ${USERNAME}@${IP} "sudo apt update > /dev/null 2> /dev/null && sudo apt install lsscsi -yq > /dev/null 2> /dev/null"
+    log "Installed lsscsi to ${VM_NAME}"
+
+    ssh -o "StrictHostKeyChecking=no" ${USERNAME}@${IP} "docker swarm join --token $WORKER_TOKEN 10.0.1.4:2377 > /dev/null 2> /dev/null"
+    log "${VM_NAME} Joined SWARM as WORKER"
+    
+done
+
+# Install
+
+ssh -o "StrictHostKeyChecking=no" ${USERNAME}@${MASTER_IPS[1]} "docker service create \
+  --name plugin-rexray-ssd \
+  --mount type=bind,source=/var/run/docker.sock,destination=/var/run/docker.sock \
+  --mode global \
+  --restart-condition none \
+  --detach \
+  mavenugo/swarm-exec:17.03.0-ce \
+  docker plugin install \
+    --alias rexray/ssd \
+    --grant-all-permissions \
+    rexray/azureud \
+      AZUREUD_CLIENTID=$RBAC_APP_ID \
+      AZUREUD_CLIENTSECRET=$RBAC_APP_SECRET \
+      AZUREUD_SUBSCRIPTIONID=$SUBSCRIPTION_ID \
+      AZUREUD_TENANTID=$RBAC_TENANT_ID \
+      AZUREUD_RESOURCEGROUP=$RESOURCE_GROUP \
+      AZUREUD_STORAGEACCOUNT=""$VOLUME_STORAGE_ACCOUNT_SSD"" \
+      AZUREUD_STORAGEACCESSKEY=""$VOLUME_STORAGE_ACCOUNT_SSD_KEY"" \
+      AZUREUD_CONTAINER=volumes
+
+docker service create \
+  --name plugin-rexray-spin \
+  --mount type=bind,source=/var/run/docker.sock,destination=/var/run/docker.sock \
+  --mode global \
+  --restart-condition none \
+  --detach \
+  mavenugo/swarm-exec:17.03.0-ce \
+  docker plugin install \
+    --alias rexray/spin \
+    --grant-all-permissions \
+    rexray/azureud \
+      AZUREUD_CLIENTID=$RBAC_APP_ID \
+      AZUREUD_CLIENTSECRET=$RBAC_APP_SECRET \
+      AZUREUD_SUBSCRIPTIONID=$SUBSCRIPTION_ID \
+      AZUREUD_TENANTID=$RBAC_TENANT_ID \
+      AZUREUD_RESOURCEGROUP=$RESOURCE_GROUP \
+      AZUREUD_STORAGEACCOUNT=""$VOLUME_STORAGE_ACCOUNT_SPIN"" \
+      AZUREUD_STORAGEACCESSKEY=""$VOLUME_STORAGE_ACCOUNT_SPIN_KEY"" \
+      AZUREUD_CONTAINER=volumes
+"
+log "INSTALLED REX-RAY plugins for ssd, spin"
+
+log "ALL WORK DONE!"
+
+log "HOSTS:"
+log "MASTERS:"
+for NODE in $(seq $MASTERS)
+do
+    log "${MASTER_IPS[$NODE]}"
+done
+log "WORKERS:"
+for NODE in $(seq $WORKERS)
+do
+    log "${WORKER_IPS[$NODE]}"
+done
+
+log "connect to docker via:"
+
+for NODE in $(seq $MASTERS)
+do
+    log "export DOCKER_HOST=ssh://${USERNAME}@${MASTER_IPS[$NODE]}"
+done
+
+log "disconnect from docker via:"
+log "unset DOCKER_HOST"
+
+log "BYE BYE!"
+
