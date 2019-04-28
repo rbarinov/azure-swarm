@@ -1,0 +1,120 @@
+#!/bin/bash
+
+# check vm sized
+# az vm list-sizes -l westeurope | grep -i ds -n5
+
+GLUSTER_IPS=()
+
+GLUSTERS=3
+RESOURCE_GROUP=$1 # swarm
+LOCATION="westeurope"
+USERNAME="swarm"
+VM_SIZE="Standard_DS4_v2"
+SSH_PUBLIC_PATH="~/.ssh/id_rsa.pub"
+OS_DISK_SIZE=40
+DATA_DISK_SIZE=2048
+
+if [[ -z "${RESOURCE_GROUP}" ]]; then
+    echo 'specify $1 resource group name'
+    exit 1
+fi
+
+log () {
+    dt=$(date '+%Y.%m.%d %H:%M:%S')
+    message="${dt}: $1"
+    echo $message >> "${RESOURCE_GROUP}.log"
+    echo $message
+}
+
+log "HELLO"
+
+# resource group
+
+SUBSCRIPTION_ID=$(az account show --output tsv |  awk '{print $2}')
+VNET="${RESOURCE_GROUP}-vnet"
+
+GLUSTER_NSG="${RESOURCE_GROUP}-gluster-nsg"
+
+az network nsg create \
+    --resource-group $RESOURCE_GROUP \
+    --name $GLUSTER_NSG \
+    --output none
+
+az network nsg rule create \
+    --resource-group $RESOURCE_GROUP \
+    --nsg-name $GLUSTER_NSG \
+    --name "${GLUSTER_NSG}-ssh" \
+    --protocol tcp \
+    --priority 1000 \
+    --destination-port-range 22 \
+    --access allow \
+    --output none
+
+log "CREATED Network Security Group $GLUSTER_NSG with open ports: 22"
+
+for NODE in $(seq $GLUSTERS)
+do
+
+    IP_NAME="${RESOURCE_GROUP}-gluster-${NODE}-ip"
+    NIC_NAME="${RESOURCE_GROUP}-gluster-${NODE}-nic"
+    VM_NAME="${RESOURCE_GROUP}-gluster-${NODE}"
+    OS_DISK_NAME="${RESOURCE_GROUP}-gluster-${NODE}-os-disk"
+
+    az network public-ip create \
+        --resource-group $RESOURCE_GROUP \
+        --name $IP_NAME \
+        --allocation-method Static \
+        --dns-name $IP_NAME \
+        --output none
+
+    GLUSTER_IPS[$NODE]=$(az network public-ip show -g $RESOURCE_GROUP -n $IP_NAME --query "{address: ipAddress}" --output tsv)
+
+    log "CREATED Static IP $IP_NAME ${GLUSTER_IPS[$NODE]} for $VM_NAME"
+
+    az network nic create \
+        --resource-group $RESOURCE_GROUP \
+        --name $NIC_NAME \
+        --vnet-name $VNET \
+        --subnet default \
+        --public-ip-address $IP_NAME \
+        --private-ip-address 10.0.1.10${NODE} \
+        --network-security-group $GLUSTER_NSG \
+        --output none
+
+    log "CREATED NIC $NIC_NAME for $VM_NAME with NSG ${GLUSTER_NSG}"
+    
+    az vm create \
+        --resource-group $RESOURCE_GROUP \
+        --name $VM_NAME \
+        --location $LOCATION \
+        --nics $NIC_NAME \
+        --image UbuntuLTS \
+        --size $VM_SIZE \
+        --admin-username $USERNAME \
+        --os-disk-name $OS_DISK_NAME \
+        --os-disk-size-gb $OS_DISK_SIZE \
+        --data-disk-sizes-gb $DATA_DISK_SIZE \
+        --ssh-key-value $SSH_PUBLIC_PATH \
+        --no-wait \
+        --output none
+
+    log "CREATED VM $VM_NAME with disk OS ${OS_DISK_SIZE}gb with user $USERNAME. => ssh ${USERNAME}@${GLUSTER_IPS[$NODE]}"
+done
+
+log "ALL WORK DONE!"
+
+log "HOSTS:"
+log "GLUSTER:"
+for NODE in $(seq $GLUSTERS)
+do
+    log "${GLUSTER_IPS[$NODE]}"
+done
+
+log "connect to ssh via:"
+
+for NODE in $(seq $GLUSTERS)
+do
+    log "ssh ${USERNAME}@${GLUSTER_IPS[$NODE]}"
+done
+
+log "BYE BYE!"
