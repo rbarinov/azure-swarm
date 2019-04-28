@@ -22,7 +22,7 @@ fi
 log () {
     dt=$(date '+%Y.%m.%d %H:%M:%S')
     message="${dt}: $1"
-    echo $message >> "${RESOURCE_GROUP}.log"
+    echo $message >> "${RESOURCE_GROUP}.gluster.log"
     echo $message
 }
 
